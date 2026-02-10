@@ -35,6 +35,7 @@ export interface AiRecommendation {
 
 // Story Mode Types
 export interface ScriptSegment {
+  id: string;
   speaker: string;
   text: string;
 }

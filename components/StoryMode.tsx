@@ -11,6 +11,7 @@ import { decodeBase64, decodeAudioData, concatenateAudioBuffers, bufferToWav } f
 import AudioVisualizer from './AudioVisualizer';
 import { SessionLogger } from '../utils/logger';
 import { keyManager, KeyState } from '../utils/keyManager';
+import { splitToSegments, TextSegment } from '../utils/textUtils';
 
 interface StoryModeProps {
   voices: Voice[];
@@ -23,7 +24,8 @@ const StoryMode: React.FC<StoryModeProps> = ({ voices, onClose }) => {
   const [step, setStep] = useState<Step>('input');
   const [text, setText] = useState('');
   const [analysis, setAnalysis] = useState<StoryAnalysis | null>(null);
-  const [assignments, setAssignments] = useState<Record<string, string>>({}); 
+  const [segments, setSegments] = useState<TextSegment[]>([]);
+  const [assignments, setAssignments] = useState<Record<string, string>>({});  
   const [progress, setProgress] = useState(0);
   const [statusMessage, setStatusMessage] = useState("Initializing...");
   const [isLowQuotaMode, setIsLowQuotaMode] = useState(false);
@@ -180,30 +182,38 @@ const StoryMode: React.FC<StoryModeProps> = ({ voices, onClose }) => {
     logger.log('ANALYSIS', 'INFO', 'Starting text analysis', { textLength: text.length });
 
     try {
+      // 1. Split text into segments locally to preserve integrity
+      const rawSegments = splitToSegments(text);
+      setSegments(rawSegments); // Store for editor
+
       const ai = new GoogleGenAI({ apiKey });
+      
+      // 2. Prepare segments for classification
+      // We send the text with indices, asking AI to just return SPEAKER for each index.
+      const segmentList = rawSegments.map((s, i) => `${i}: ${s.text}`).join('\n');
+
       const prompt = `
         You are a casting director for an audio drama.
-        Analyze the following novel chapter.
+        Analyze the following text segments from a novel chapter.
         
         Tasks:
         1. Identify the 'Narrator' and all distinct characters who speak.
-        2. Create a character profile for each.
-        3. Break the text down into a sequential script.
+        2. Assign a speaker to EACH segment index.
+        3. Create a character profile for each identified character.
         
         Rules:
-        - "Narrator" must be included.
-        - CRITICAL: Always use the exact English name "Narrator" for the narration role.
-        - For Narrator lines, text should include descriptions and actions.
-        - For Character lines, text should be ONLY the spoken dialogue.
+        - "Narrator" must be used for narration/descriptive text.
+        - CRITICAL: Return a list of { index, speaker } that EXACTLY matches the input indices.
+        - Do not rewriting the text.
         
-        Input Text:
+        Input Segments:
         """
-        ${text.substring(0, 25000)} 
+        ${segmentList.substring(0, 30000)} 
         """
       `;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-2.0-flash-exp', // Use faster model
         contents: prompt,
         config: {
           responseMimeType: 'application/json',
@@ -222,15 +232,15 @@ const StoryMode: React.FC<StoryModeProps> = ({ voices, onClose }) => {
                   required: ['name', 'gender', 'description']
                 }
               },
-              script: {
+              speakerMap: {
                 type: Type.ARRAY,
                 items: {
                   type: Type.OBJECT,
                   properties: {
+                    index: { type: Type.INTEGER },
                     speaker: { type: Type.STRING },
-                    text: { type: Type.STRING },
                   },
-                  required: ['speaker', 'text']
+                  required: ['index', 'speaker']
                 }
               }
             }
@@ -238,24 +248,41 @@ const StoryMode: React.FC<StoryModeProps> = ({ voices, onClose }) => {
         }
       });
       
-      const result = JSON.parse(response.text || '{}') as StoryAnalysis;
+      const result = JSON.parse(response.text || '{}');
       
+      // 3. Merge AI classification with original segments
       const NARRATOR_ALIASES = ['narrator', 'рассказчик', 'narrateur', 'erzähler', 'narrador'];
+      const speakerMap = new Map<number, string>();
       
-      result.script.forEach(segment => {
-         if (NARRATOR_ALIASES.includes(segment.speaker.toLowerCase())) {
-            segment.speaker = 'Narrator';
-         }
-      });
+      if (result.speakerMap) {
+          result.speakerMap.forEach((item: any) => {
+             let speaker = item.speaker;
+             if (NARRATOR_ALIASES.includes(speaker.toLowerCase())) {
+                 speaker = 'Narrator';
+             }
+             speakerMap.set(item.index, speaker);
+          });
+      }
 
-      const activeSpeakers = new Set(result.script.map(s => s.speaker));
+      // Update segment speakers
+      const classifiedSegments = rawSegments.map((seg, idx) => ({
+          ...seg,
+          speaker: speakerMap.get(idx) || 'Narrator' 
+      }));
       
-      let characters = result.characters || [];
+      setSegments(classifiedSegments);
+
+      // 4. Process Characters
+      const activeSpeakers = new Set(classifiedSegments.map(s => s.speaker));
+      let characters: CharacterProfile[] = result.characters || [];
+      
+      // Filter out unused characters from AI
       characters = characters.filter(c => {
          if (c.name === 'Narrator') return activeSpeakers.has('Narrator'); 
          return activeSpeakers.has(c.name);
       });
 
+      // Add missing characters (if AI missed defining them but used them in map)
       activeSpeakers.forEach(speaker => {
           if (!characters.find(c => c.name === speaker)) {
               characters.push({ 
@@ -270,15 +297,17 @@ const StoryMode: React.FC<StoryModeProps> = ({ voices, onClose }) => {
          characters.unshift({ name: 'Narrator', gender: 'Neutral', description: 'Story narrator' });
       }
 
-      result.characters = characters;
+      const fullAnalysis: StoryAnalysis = {
+          characters,
+          script: classifiedSegments.map(s => ({
+              id: s.id,
+              speaker: s.speaker,
+              text: s.text
+          }))
+      };
 
-      logger.log('ANALYSIS', 'INFO', 'Analysis result parsed', { 
-        characterCount: result.characters.length, 
-        scriptSegments: result.script.length 
-      });
-
-      setAnalysis(result);
-      performSmartCasting(result);
+      setAnalysis(fullAnalysis);
+      performSmartCasting(fullAnalysis);
       setStep('casting');
 
     } catch (e: any) {
@@ -598,24 +627,52 @@ const StoryMode: React.FC<StoryModeProps> = ({ voices, onClose }) => {
                      <h3 className="font-bold text-zinc-900 dark:text-white flex items-center gap-2">
                         <User size={18} /> Cast Your Characters
                      </h3>
-                     <button 
-                        onClick={() => performSmartCasting(analysis)}
-                        className="text-xs flex items-center gap-1 text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 font-medium"
-                     >
-                        <Sparkles size={12} /> Recalculate Matches
-                     </button>
+                     <div className="flex gap-2">
+                        <button 
+                             onClick={() => {
+                                 const name = prompt("Enter new character name:");
+                                 if (name) {
+                                     const newChar = { name, gender: 'unknown', description: 'Custom character' };
+                                     setAnalysis(prev => prev ? ({...prev, characters: [...prev.characters, newChar]}) : null);
+                                 }
+                             }}
+                            className="text-xs flex items-center gap-1 text-green-600 dark:text-green-400 hover:text-green-700 font-medium"
+                        >
+                            + Add Role
+                        </button>
+                         <button 
+                            onClick={() => performSmartCasting(analysis)}
+                            className="text-xs flex items-center gap-1 text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 font-medium"
+                         >
+                            <Sparkles size={12} /> Recalculate Matches
+                         </button>
+                     </div>
                   </div>
                   
                   <div className="space-y-3">
                     {analysis.characters.map((char) => (
                       <div key={char.name} className={`p-4 rounded-xl border shadow-sm flex flex-col gap-3 transition-colors ${char.name === 'Narrator' ? 'bg-indigo-50/50 dark:bg-indigo-900/10 border-indigo-100 dark:border-indigo-800/30' : 'bg-white dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700'}`}>
-                        <div className="flex items-start justify-between gap-4">
-                            <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-4">
+                            <div className="min-w-0 flex-1 group/desc">
                                 <div className="flex items-center gap-2">
                                     <div className="font-bold text-zinc-900 dark:text-white truncate">{char.name}</div>
                                     {char.name === 'Narrator' && <span className="px-1.5 py-0.5 rounded text-[10px] bg-indigo-100 text-indigo-700 font-bold uppercase tracking-wider">Host</span>}
                                 </div>
-                                <div className="text-xs text-zinc-500 dark:text-zinc-400 line-clamp-2 mt-1 italic">{char.description}</div>
+                                <div 
+                                    className="text-xs text-zinc-500 dark:text-zinc-400 line-clamp-2 mt-1 italic cursor-pointer hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors border-b border-transparent hover:border-zinc-300 border-dashed"
+                                    onClick={() => {
+                                        const newDesc = prompt("Update character description (e.g., 'Young girl, cheerful'):", char.description);
+                                        if (newDesc !== null) {
+                                            const newChars = analysis.characters.map(c => 
+                                                c.name === char.name ? { ...c, description: newDesc } : c
+                                            );
+                                            setAnalysis({ ...analysis, characters: newChars });
+                                        }
+                                    }}
+                                    title="Click to edit description for better casting"
+                                >
+                                    {char.description || "No description"}
+                                </div>
                             </div>
                         </div>
                         
@@ -655,32 +712,50 @@ const StoryMode: React.FC<StoryModeProps> = ({ voices, onClose }) => {
                   </div>
                 </div>
 
-                {/* Script Preview */}
+                {/* Script Editor */}
                 <div className="space-y-4 h-full flex flex-col">
                   <h3 className="font-bold text-zinc-900 dark:text-white flex items-center gap-2">
-                    <FileText size={18} /> Script Preview
+                    <FileText size={18} /> Script Editor
                   </h3>
-                  <div className="flex-1 bg-white dark:bg-zinc-800 rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 overflow-y-auto max-h-[500px] text-sm space-y-4 custom-scrollbar">
-                     {analysis.script.slice(0, 30).map((line, idx) => (
-                        <div key={idx} className="flex gap-4 group">
-                           <div className="shrink-0 w-24 pt-1">
-                                <div className={`text-xs font-bold uppercase tracking-wider truncate ${line.speaker === 'Narrator' ? 'text-zinc-400' : 'text-indigo-600 dark:text-indigo-400'}`}>
-                                    {line.speaker}
-                                </div>
-                                <div className="text-[10px] text-zinc-400 dark:text-zinc-600 truncate">
+                  <div className="flex-1 bg-white dark:bg-zinc-800 rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 overflow-y-auto max-h-[500px] text-sm space-y-2 custom-scrollbar">
+                     {analysis.script.map((line, idx) => (
+                        <div key={line.id || idx} className="flex gap-2 group items-start hover:bg-zinc-50 dark:hover:bg-zinc-700/50 p-2 rounded transition-colors">
+                           {/* Speaker Select */}
+                           <div className="shrink-0 w-32 pt-1">
+                                <select 
+                                    className={`text-xs font-bold uppercase tracking-wider w-full bg-transparent border-b border-transparent hover:border-zinc-300 focus:border-indigo-500 outline-none cursor-pointer truncate ${line.speaker === 'Narrator' ? 'text-zinc-400' : 'text-indigo-600 dark:text-indigo-400'}`}
+                                    value={line.speaker}
+                                    onChange={(e) => {
+                                        const newScript = [...analysis.script];
+                                        newScript[idx].speaker = e.target.value;
+                                        setAnalysis({ ...analysis, script: newScript });
+                                    }}
+                                >
+                                    {analysis.characters.map(c => (
+                                        <option key={c.name} value={c.name}>{c.name}</option>
+                                    ))}
+                                    <option value="Narrator">Narrator</option>
+                                </select>
+                                <div className="text-[10px] text-zinc-400 dark:text-zinc-600 truncate mt-0.5">
                                     {assignments[line.speaker]}
                                 </div>
                            </div>
-                           <div className={`flex-1 font-serif leading-relaxed ${line.speaker === 'Narrator' ? 'text-zinc-500 dark:text-zinc-400 italic' : 'text-zinc-800 dark:text-zinc-200'}`}>
-                              {line.text}
+                           
+                           {/* Text Editor */}
+                           <div className="flex-1">
+                               <textarea
+                                    className={`w-full bg-transparent resize-none outline-none font-serif leading-relaxed overflow-hidden py-1 ${line.speaker === 'Narrator' ? 'text-zinc-500 dark:text-zinc-400 italic' : 'text-zinc-800 dark:text-zinc-200'}`}
+                                    rows={Math.max(1, Math.ceil(line.text.length / 60))}
+                                    value={line.text}
+                                    onChange={(e) => {
+                                        const newScript = [...analysis.script];
+                                        newScript[idx].text = e.target.value;
+                                        setAnalysis({ ...analysis, script: newScript });
+                                    }}
+                               />
                            </div>
                         </div>
                      ))}
-                     {analysis.script.length > 30 && (
-                        <div className="text-center text-xs text-zinc-400 italic pt-2">
-                           ...and {analysis.script.length - 30} more lines
-                        </div>
-                     )}
                   </div>
                 </div>
               </div>
