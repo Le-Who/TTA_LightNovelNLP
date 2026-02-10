@@ -334,126 +334,111 @@ const StoryMode: React.FC<StoryModeProps> = ({ voices, onClose }) => {
     
     const MAX_RETRIES = 5;
     
-    // Warm-up params
-    let activeConcurrencyLimit = 1; 
-    let activeBatchDelay = 150; 
-
     logger.startTimer('total-generation');
 
     try {
       let completedCount = 0;
       
-      const processSegment = async (index: number) => {
-          if (!isMountedRef.current) return;
-          const segment = optimizedScript[index];
-          if (!segment.text.trim()) return;
 
-          const assignedVoice = assignments[segment.speaker] || assignments['Narrator'] || voices[0].name;
-          
-          let retryCount = 0;
-          let success = false;
-          const segmentTimerKey = `segment-${index}`;
 
-          while (!success && retryCount < MAX_RETRIES) {
-             if (!isMountedRef.current) break;
-             
-             // Get working key
-             const currentKey = keyManager.getWorkingKey();
-             const localAi = new GoogleGenAI({ apiKey: currentKey });
-
-             logger.startTimer(segmentTimerKey);
-
-             try {
-                const response = await localAi.models.generateContent({
-                  model: "gemini-2.5-flash-preview-tts",
-                  contents: { parts: [{ text: segment.text }] },
-                  config: {
-                    responseModalities: [Modality.AUDIO],
-                    speechConfig: {
-                      voiceConfig: { prebuiltVoiceConfig: { voiceName: assignedVoice } },
-                    },
-                  },
-                });
+      // Queue-based Generation Loop
+      const queue = optimizedScript.map((segment, index) => ({ segment, index }));
+      let completedCount = 0;
+      let activeWorkers = 0;
       
-                const latency = logger.endTimer(segmentTimerKey, 'API_LATENCY');
-                const audioData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-                
-                if (audioData) {
-                  const rawBytes = decodeBase64(audioData);
-                  const buffer = await decodeAudioData(rawBytes, audioContext, 24000);
-                  // Add a small pause at end of sentence
-                  const pauseBuffer = audioContext.createBuffer(1, 24000 * 0.25, 24000);
-                  const combined = concatenateAudioBuffers(audioContext, [buffer, pauseBuffer]);
-                  
-                  orderedBuffers[index] = combined;
-                  success = true;
-                } else {
-                   throw new Error("No audio data returned");
-                }
+      // Dynamic concurrency based on key availability
+      const MAX_CONCURRENCY = Math.min(3, keyManager.activeKeyCount * 2); 
 
-             } catch (err: any) {
-                // HANDLE 429 & KEY EXHAUSTION
-                const isRateLimit = err.status === 429 || err.message?.includes('429') || err.message?.includes('quota') || err.message?.includes('RESOURCE_EXHAUSTED');
-                
-                if (isRateLimit) {
-                   retryCount++;
-                   logger.log('GENERATION', 'WARN', `429 Hit on key ending ...${currentKey.slice(-4)}`);
-                   
-                   // JAIL THE KEY
-                   keyManager.jailCurrentKey(60000); 
-                   setKeyStates(keyManager.getKeyStates()); // Update debug UI immediately
-
-                   // Only throttle if ALL keys are jailed
-                   if (keyManager.allKeysJailed()) {
-                       setIsLowQuotaMode(true);
-                       activeConcurrencyLimit = 1;
-                       activeBatchDelay = 5000;
-                       
-                       const waitTime = Math.pow(2, retryCount) * 2000;
-                       setStatusMessage(`Quota limit (Safe Mode). Waiting ${Math.ceil(waitTime/1000)}s...`);
-                       await delay(waitTime);
-                   } else {
-                       setStatusMessage(`Switching API keys...`);
-                       await delay(200); 
-                   }
-
-                } else {
-                   console.error(`Failed to generate segment ${index}`, err);
-                   break; // Non-retriable
-                }
-             }
-          }
+      const processQueue = async () => {
+          if (!isMountedRef.current) return;
           
-          if (success) completedCount++;
-          setProgress(Math.round((completedCount / optimizedScript.length) * 100));
-          setStatusMessage(`Processing segment ${completedCount}/${optimizedScript.length}`);
+          while (queue.length > 0) {
+              // 1. Check if we can start a new worker
+              if (activeWorkers >= MAX_CONCURRENCY) {
+                  await delay(200);
+                  continue;
+              }
+
+              // 2. Try to reserve a key
+              const key = keyManager.reserveKey();
+              if (!key) {
+                  setStatusMessage("Rate limit reached. Waiting for available key...");
+                  await delay(2000); // Wait for cooldown
+                  continue;
+              }
+
+              // 3. Take job
+              const job = queue.shift();
+              if (!job) break;
+
+              activeWorkers++;
+              
+              // Process in background (don't await here to allow concurrency)
+              processItem(job, key).finally(() => {
+                  activeWorkers--;
+              });
+          }
+
+          // Wait for stragglers
+          while (activeWorkers > 0) {
+              await delay(500);
+          }
       };
 
-      // Loop with dynamic concurrency
-      let currentIndex = 0;
-      while (currentIndex < optimizedScript.length) {
-          if (!isMountedRef.current) break;
-          
-          if (completedCount > 1 && !isLowQuotaMode) {
-              activeConcurrencyLimit = 3;
-          }
+      const processItem = async (job: { segment: ScriptSegment, index: number }, apiKey: string) => {
+          if (!isMountedRef.current) return;
+          const { segment, index } = job;
+          const assignedVoice = assignments[segment.speaker] || assignments['Narrator'] || voices[0].name;
+          const segmentTimerKey = `segment-${index}`;
 
-          const currentBatchSize = activeConcurrencyLimit;
-          const batchPromises = [];
-          
-          for (let j = 0; j < currentBatchSize; j++) {
-              if (currentIndex + j < optimizedScript.length) {
-                  batchPromises.push(processSegment(currentIndex + j));
-              }
-          }
-          
-          await Promise.all(batchPromises);
-          currentIndex += currentBatchSize;
+          try {
+             const localAi = new GoogleGenAI({ apiKey });
+             logger.startTimer(segmentTimerKey);
 
-          if (currentIndex < optimizedScript.length) {
-              await delay(activeBatchDelay);
+             const response = await localAi.models.generateContent({
+                model: "gemini-2.0-flash-exp", // Updated to latest flash model for speed
+                contents: { parts: [{ text: segment.text }] },
+                config: {
+                  responseModalities: [Modality.AUDIO],
+                  speechConfig: {
+                    voiceConfig: { prebuiltVoiceConfig: { voiceName: assignedVoice } },
+                  },
+                },
+             });
+
+             const latency = logger.endTimer(segmentTimerKey, 'API_LATENCY');
+             const audioData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+             
+             if (audioData) {
+                const rawBytes = decodeBase64(audioData);
+                const buffer = await decodeAudioData(rawBytes, audioContext, 24000);
+                const pauseBuffer = audioContext.createBuffer(1, 24000 * 0.25, 24000);
+                const combined = concatenateAudioBuffers(audioContext, [buffer, pauseBuffer]);
+                
+                orderedBuffers[index] = combined;
+                completedCount++;
+                setProgress(Math.round((completedCount / optimizedScript.length) * 100));
+                setStatusMessage(`Processing segment ${completedCount}/${optimizedScript.length}`);
+             } else {
+                throw new Error("No audio data returned");
+             }
+
+          } catch (err: any) {
+             const isRateLimit = err.status === 429 || err.message?.includes('429');
+             
+             if (isRateLimit) {
+                 logger.log('GENERATION', 'WARN', `429 Hit on key ending ...${apiKey.slice(-4)}`);
+                 keyManager.jailCurrentKey(60000); // Jail the specific key if possible, currently jails current
+                 // Re-queue the job
+                 queue.unshift(job);
+             } else {
+                 console.error(`Failed segment ${index}`, err);
+                 // Don't re-queue fatal errors, just skip
+             }
           }
-      }
+      };
+
+      await processQueue();
 
       if (!isMountedRef.current) return;
 
